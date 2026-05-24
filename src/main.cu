@@ -135,8 +135,8 @@ void run_benchmark(const Args& args, cudaStream_t stream) {
     }
 
     // --- report ------------------------------------------------------------
-    report("cuFFT  (3-kernel pipeline)", t_cufft,   args.fft_size, args.batch);
-    report("cuFFTDx (fused kernel)",     t_cufftdx, args.fft_size, args.batch);
+    report("cuFFT  (load-callback on IFFT)", t_cufft,   args.fft_size, args.batch);
+    report("cuFFTDx (fused kernel)",         t_cufftdx, args.fft_size, args.batch);
 
     const double speedup = t_cufft.total_ms / t_cufftdx.total_ms;
     std::printf("\nspeedup (cuFFTDx vs cuFFT): %.2fx\n", speedup);

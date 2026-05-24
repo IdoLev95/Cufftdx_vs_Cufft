@@ -101,9 +101,13 @@ add_executable(benchmark src/main.cu)
 
 target_include_directories(benchmark PRIVATE src)
 
+# cuFFT callbacks (cufftXtSetCallback) are only supported by the static
+# cuFFT library and require relocatable device code. The dynamic libcufft.so
+# returns CUFFT_NOT_IMPLEMENTED from cufftXtSetCallback.
 target_link_libraries(benchmark PRIVATE
     ${CUFFTDX_TARGET}
-    CUDA::cufft
+    CUDA::cufft_static
+    CUDA::culibos
     CUDA::cudart
 )
 
@@ -121,5 +125,5 @@ target_compile_options(benchmark PRIVATE
 )
 
 set_target_properties(benchmark PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
+    CUDA_SEPARABLE_COMPILATION ON
 )
