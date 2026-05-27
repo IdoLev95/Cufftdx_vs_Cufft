@@ -12,8 +12,10 @@
 
 struct Args {
     enum class Precision { Single, Double };
+    enum class Signal    { Random, Zeros, Ones, Sine };
 
     Precision precision = Precision::Single;
+    Signal    signal    = Signal::Random;
     int batch = 64;
     int fft_size = BENCHMARK_FFT_SIZE;
     int iterations = 100;
@@ -24,6 +26,9 @@ inline void print_usage(const char* prog) {
     std::fprintf(stderr,
         "Usage: %s [options]\n"
         "  --precision {single|double}   Complex element precision (default: single)\n"
+        "  --signal {random|zeros|ones|sine}\n"
+        "                                Content of d_signal (input). FFT throughput is\n"
+        "                                data-independent; this lets you verify it (default: random)\n"
         "  --batch N                     Number of independent FFTs per iteration (default: 64)\n"
         "  --fft-size M                  FFT length; must equal compile-time BENCHMARK_FFT_SIZE=%d\n"
         "                                and be a power of 2 (default: %d)\n"
@@ -39,6 +44,16 @@ inline bool is_power_of_two(int x) {
 
 inline const char* precision_name(Args::Precision p) {
     return p == Args::Precision::Single ? "single" : "double";
+}
+
+inline const char* signal_name(Args::Signal s) {
+    switch (s) {
+        case Args::Signal::Random: return "random";
+        case Args::Signal::Zeros:  return "zeros";
+        case Args::Signal::Ones:   return "ones";
+        case Args::Signal::Sine:   return "sine";
+    }
+    return "?";
 }
 
 inline Args parse_args(int argc, char** argv) {
@@ -63,6 +78,17 @@ inline Args parse_args(int argc, char** argv) {
             else if (!std::strcmp(v, "double")) args.precision = Args::Precision::Double;
             else {
                 std::fprintf(stderr, "error: --precision must be 'single' or 'double' (got '%s')\n", v);
+                std::exit(2);
+            }
+        } else if (!std::strcmp(a, "--signal")) {
+            need_value(i);
+            const char* v = argv[++i];
+            if      (!std::strcmp(v, "random")) args.signal = Args::Signal::Random;
+            else if (!std::strcmp(v, "zeros"))  args.signal = Args::Signal::Zeros;
+            else if (!std::strcmp(v, "ones"))   args.signal = Args::Signal::Ones;
+            else if (!std::strcmp(v, "sine"))   args.signal = Args::Signal::Sine;
+            else {
+                std::fprintf(stderr, "error: --signal must be 'random', 'zeros', 'ones', or 'sine' (got '%s')\n", v);
                 std::exit(2);
             }
         } else if (!std::strcmp(a, "--batch")) {

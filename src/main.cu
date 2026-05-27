@@ -1,4 +1,5 @@
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -19,30 +20,79 @@ struct TimedRun {
     int   timed_iters   = 0;
 };
 
-// Time a callable that submits work on `stream`, with `warmup` untimed runs
-// followed by `iters` timed runs. cudaEventElapsedTime measures stream-local
-// elapsed time, so wall-clock jitter from other host work doesn't leak in.
-template <typename Fn>
-TimedRun time_on_stream(Fn&& submit, int warmup, int iters, cudaStream_t stream) {
-    cudaEvent_t start, stop;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
+// Overwrites d_signal with a fresh content derived from iter_seed. Called in
+// the prep step (outside the timing window) so each warmup and timed iter
+// runs the FFT on a different input. Treats the buffer as 2*n_complex reals
+// (interleaved re/im) so one launch covers both components.
+template <typename Real>
+__global__ void fill_signal_kernel(Real* x, std::size_t n_complex,
+                                   std::uint32_t iter_seed, int signal_kind,
+                                   int fft_size) {
+    const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= n_complex) return;
 
-    for (int i = 0; i < warmup; ++i) submit();
+    Real re, im;
+    switch (signal_kind) {
+        case 0: {  // random — varies per iter via iter_seed
+            std::uint32_t h = static_cast<std::uint32_t>(idx) * 2654435761u + iter_seed;
+            h ^= h >> 16; h *= 0x85ebca6bu;
+            h ^= h >> 13; h *= 0xc2b2ae35u;
+            h ^= h >> 16;
+            re = (static_cast<Real>(h >> 8) / static_cast<Real>(1u << 24)) * Real(2) - Real(1);
+            h = h * 1664525u + 1013904223u; h ^= h >> 16;
+            im = (static_cast<Real>(h >> 8) / static_cast<Real>(1u << 24)) * Real(2) - Real(1);
+            break;
+        }
+        case 1: re = Real(0); im = Real(0); break;
+        case 2: re = Real(1); im = Real(0); break;
+        case 3: {  // sine — phase-shifted per iter so content still changes
+            const int i = static_cast<int>(idx % static_cast<std::size_t>(fft_size));
+            const Real phase = Real(2) * Real(M_PI) * Real(i) / Real(fft_size)
+                             + Real(iter_seed) * Real(0.01);
+            re = cos(phase); im = sin(phase);
+            break;
+        }
+        default: re = Real(0); im = Real(0);
+    }
+    x[2 * idx + 0] = re;
+    x[2 * idx + 1] = im;
+}
+
+// Time a kernel callable on `stream`, with `warmup` untimed runs followed by
+// `iters` timed runs. `prep` runs every iteration but stays *outside* the
+// timing window — useful when the prep step (e.g. an input-restore d2d copy)
+// is part of the harness, not the work under test. One event pair per
+// iteration brackets only the kernel; sum of elapsed-times is kernel-only.
+template <typename Prep, typename Kernel>
+TimedRun time_kernel_only(Prep&& prep, Kernel&& kernel,
+                          int warmup, int iters, cudaStream_t stream) {
+    for (int i = 0; i < warmup; ++i) { prep(); kernel(); }
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    CUDA_CHECK(cudaEventRecord(start, stream));
-    for (int i = 0; i < iters; ++i) submit();
-    CUDA_CHECK(cudaEventRecord(stop, stream));
-    CUDA_CHECK(cudaEventSynchronize(stop));
+    std::vector<cudaEvent_t> starts(iters), stops(iters);
+    for (int i = 0; i < iters; ++i) {
+        CUDA_CHECK(cudaEventCreate(&starts[i]));
+        CUDA_CHECK(cudaEventCreate(&stops[i]));
+    }
+
+    for (int i = 0; i < iters; ++i) {
+        prep();
+        CUDA_CHECK(cudaEventRecord(starts[i], stream));
+        kernel();
+        CUDA_CHECK(cudaEventRecord(stops[i], stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
     TimedRun r;
     r.warmup_iters = warmup;
     r.timed_iters  = iters;
-    CUDA_CHECK(cudaEventElapsedTime(&r.total_ms, start, stop));
-
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
+    for (int i = 0; i < iters; ++i) {
+        float ms = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, starts[i], stops[i]));
+        r.total_ms += ms;
+        CUDA_CHECK(cudaEventDestroy(starts[i]));
+        CUDA_CHECK(cudaEventDestroy(stops[i]));
+    }
     return r;
 }
 
@@ -70,21 +120,18 @@ void run_benchmark(const Args& args, cudaStream_t stream) {
     using fft_complex_t = cufft_complex_t<T>;
 
     // --- workload setup ----------------------------------------------------
-    auto w = Workload<T>::generate(args.fft_size, args.batch);
+    auto w = Workload<T>::generate(args.fft_size, args.batch, args.signal);
 
     fft_complex_t* d_signal  = nullptr;
     fft_complex_t* d_filter  = nullptr;
-    fft_complex_t* d_signal0 = nullptr;  // pristine copy, restored before each iter
 
     const std::size_t signal_bytes = sizeof(fft_complex_t) * w.input.size();
     const std::size_t filter_bytes = sizeof(fft_complex_t) * w.filter.size();
 
-    CUDA_CHECK(cudaMalloc(&d_signal,  signal_bytes));
-    CUDA_CHECK(cudaMalloc(&d_signal0, signal_bytes));
-    CUDA_CHECK(cudaMalloc(&d_filter,  filter_bytes));
+    CUDA_CHECK(cudaMalloc(&d_signal, signal_bytes));
+    CUDA_CHECK(cudaMalloc(&d_filter, filter_bytes));
 
-    CUDA_CHECK(cudaMemcpyAsync(d_signal0, w.input.data(),  signal_bytes, cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_filter,  w.filter.data(), filter_bytes, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_filter, w.filter.data(), filter_bytes, cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // The filter is transformed once and reused. Use cuFFT for both paths so
@@ -101,19 +148,32 @@ void run_benchmark(const Args& args, cudaStream_t stream) {
     using Desc = CufftdxDescriptor<T, BENCHMARK_FFT_SIZE, BENCHMARK_SM_ARCH>;
     CufftdxPath<Desc> cufftdx(args.batch, stream);
 
-    auto restore_input = [&]() {
-        CUDA_CHECK(cudaMemcpyAsync(d_signal, d_signal0, signal_bytes,
-                                   cudaMemcpyDeviceToDevice, stream));
+    // Per-iter signal regeneration. Counter increments on every call (warmup
+    // + timed), so each FFT runs on different content. Reset between paths
+    // so cuFFT and cuFFTDx see the *same* sequence of inputs — verify still
+    // compares matching final outputs.
+    int prep_counter = 0;
+    const std::size_t n_complex = w.input.size();
+    const int kFillThreads = 256;
+    const unsigned int kFillBlocks =
+        static_cast<unsigned int>((n_complex + kFillThreads - 1) / kFillThreads);
+    const int signal_kind = static_cast<int>(args.signal);
+
+    auto regenerate_input = [&]() {
+        fill_signal_kernel<T><<<kFillBlocks, kFillThreads, 0, stream>>>(
+            reinterpret_cast<T*>(d_signal), n_complex,
+            0xA5A5A5A5u + static_cast<std::uint32_t>(prep_counter),
+            signal_kind, args.fft_size);
+        ++prep_counter;
     };
 
     constexpr int kWarmup = 10;
 
     // --- cuFFT path --------------------------------------------------------
-    auto run_cufft = [&]() {
-        restore_input();
-        cufft.run(d_signal, d_filter);
-    };
-    auto t_cufft = time_on_stream(run_cufft, kWarmup, args.iterations, stream);
+    auto prep_cufft   = [&]() { regenerate_input(); };
+    auto kern_cufft   = [&]() { cufft.run(d_signal, d_filter); };
+    auto t_cufft = time_kernel_only(prep_cufft, kern_cufft,
+                                    kWarmup, args.iterations, stream);
 
     std::vector<fft_complex_t> out_cufft;
     if (args.verify) {
@@ -122,11 +182,11 @@ void run_benchmark(const Args& args, cudaStream_t stream) {
     }
 
     // --- cuFFTDx path ------------------------------------------------------
-    auto run_cufftdx = [&]() {
-        restore_input();
-        cufftdx.run(d_signal, d_filter);
-    };
-    auto t_cufftdx = time_on_stream(run_cufftdx, kWarmup, args.iterations, stream);
+    prep_counter = 0;  // replay the same input sequence for verify parity
+    auto prep_cufftdx = [&]() { regenerate_input(); };
+    auto kern_cufftdx = [&]() { cufftdx.run(d_signal, d_filter); };
+    auto t_cufftdx = time_kernel_only(prep_cufftdx, kern_cufftdx,
+                                      kWarmup, args.iterations, stream);
 
     std::vector<fft_complex_t> out_cufftdx;
     if (args.verify) {
@@ -155,7 +215,6 @@ void run_benchmark(const Args& args, cudaStream_t stream) {
     }
 
     CUDA_CHECK(cudaFree(d_signal));
-    CUDA_CHECK(cudaFree(d_signal0));
     CUDA_CHECK(cudaFree(d_filter));
 }
 
@@ -176,6 +235,7 @@ int main(int argc, char** argv) {
     std::printf("cufft_vs_cufftdx_benchmark\n");
     std::printf("  device:        %s (SM %u)\n", props.name, runtime_sm);
     std::printf("  precision:     %s\n",   precision_name(args.precision));
+    std::printf("  signal:        %s\n",   signal_name(args.signal));
     std::printf("  fft_size:      %d (compile-time)\n", BENCHMARK_FFT_SIZE);
     std::printf("  batch:         %d\n",   args.batch);
     std::printf("  iterations:    %d\n",   args.iterations);

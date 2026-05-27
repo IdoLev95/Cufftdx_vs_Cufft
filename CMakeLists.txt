@@ -50,7 +50,7 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-set(FFT_SIZE 1024 CACHE STRING "Compile-time FFT size for cuFFTDx (power of 2)")
+set(FFT_SIZE 4096 CACHE STRING "Compile-time FFT size for cuFFTDx (power of 2)")
 math(EXPR _fft_size_is_pow2 "(${FFT_SIZE} & (${FFT_SIZE} - 1))")
 if(NOT FFT_SIZE GREATER 0 OR NOT _fft_size_is_pow2 EQUAL 0)
     message(FATAL_ERROR "FFT_SIZE must be a positive power of 2 (got ${FFT_SIZE})")

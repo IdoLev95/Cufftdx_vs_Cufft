@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "cli.hpp"
 #include "common.hpp"
 
 // Deterministic synthetic workload: a complex input signal (varies per batch
@@ -18,7 +19,8 @@ struct Workload {
     std::vector<cufft_complex_t<T>> input;     // batch * fft_size
     std::vector<cufft_complex_t<T>> filter;    // fft_size
 
-    static Workload generate(int fft_size, int batch) {
+    static Workload generate(int fft_size, int batch,
+                             Args::Signal signal = Args::Signal::Random) {
         Workload w;
         w.fft_size = fft_size;
         w.batch    = batch;
@@ -32,9 +34,29 @@ struct Workload {
             return (static_cast<T>(state >> 8) / static_cast<T>(1u << 24)) * T(2) - T(1);
         };
 
-        for (auto& s : w.input) {
-            s.x = next_unit();
-            s.y = next_unit();
+        switch (signal) {
+            case Args::Signal::Random:
+                for (auto& s : w.input) { s.x = next_unit(); s.y = next_unit(); }
+                break;
+            case Args::Signal::Zeros:
+                for (auto& s : w.input) { s.x = T(0); s.y = T(0); }
+                break;
+            case Args::Signal::Ones:
+                for (auto& s : w.input) { s.x = T(1); s.y = T(0); }
+                break;
+            case Args::Signal::Sine: {
+                // One cycle per FFT row, same content across batch rows.
+                const T two_pi_over_n = T(2) * T(M_PI) / T(fft_size);
+                for (int b = 0; b < batch; ++b) {
+                    for (int i = 0; i < fft_size; ++i) {
+                        const T phase = two_pi_over_n * T(i);
+                        auto& s = w.input[static_cast<std::size_t>(b) * fft_size + i];
+                        s.x = std::cos(phase);
+                        s.y = std::sin(phase);
+                    }
+                }
+                break;
+            }
         }
 
         // A simple low-pass-ish filter: a few non-zero taps. Anything works
